@@ -13,8 +13,12 @@ from slicer.parameterNodeWrapper import (
     parameterNodeWrapper,
     WithinRange,
 )
+from qt import QWidget, QObject, QEvent, QApplication, Qt
 
 from slicer import vtkMRMLScalarVolumeNode
+from datetime import datetime
+import time
+import csv
 
 
 #
@@ -64,41 +68,7 @@ def registerSampleData():
 
     iconsPath = os.path.join(os.path.dirname(__file__), "Resources/Icons")
 
-    # To ensure that the source code repository remains small (can be downloaded and installed quickly)
-    # it is recommended to store data sets that are larger than a few MB in a Github release.
-
-    # TractDesktop1
-    SampleData.SampleDataLogic.registerCustomSampleDataSource(
-        # Category and sample name displayed in Sample Data module
-        category="TractDesktop",
-        sampleName="TractDesktop1",
-        # Thumbnail should have size of approximately 260x280 pixels and stored in Resources/Icons folder.
-        # It can be created by Screen Capture module, "Capture all views" option enabled, "Number of images" set to "Single".
-        thumbnailFileName=os.path.join(iconsPath, "TractDesktop1.png"),
-        # Download URL and target file name
-        uris="https://github.com/Slicer/SlicerTestingData/releases/download/SHA256/998cb522173839c78657f4bc0ea907cea09fd04e44601f17c82ea27927937b95",
-        fileNames="TractDesktop1.nrrd",
-        # Checksum to ensure file integrity. Can be computed by this command:
-        #  import hashlib; print(hashlib.sha256(open(filename, "rb").read()).hexdigest())
-        checksums="SHA256:998cb522173839c78657f4bc0ea907cea09fd04e44601f17c82ea27927937b95",
-        # This node name will be used when the data set is loaded
-        nodeNames="TractDesktop1",
-    )
-
-    # TractDesktop2
-    SampleData.SampleDataLogic.registerCustomSampleDataSource(
-        # Category and sample name displayed in Sample Data module
-        category="TractDesktop",
-        sampleName="TractDesktop2",
-        thumbnailFileName=os.path.join(iconsPath, "TractDesktop2.png"),
-        # Download URL and target file name
-        uris="https://github.com/Slicer/SlicerTestingData/releases/download/SHA256/1a64f3f422eb3d1c9b093d1a18da354b13bcf307907c66317e2463ee530b7a97",
-        fileNames="TractDesktop2.nrrd",
-        checksums="SHA256:1a64f3f422eb3d1c9b093d1a18da354b13bcf307907c66317e2463ee530b7a97",
-        # This node name will be used when the data set is loaded
-        nodeNames="TractDesktop2",
-    )
-
+    
 
 #
 # TractDesktopParameterNode
@@ -118,10 +88,7 @@ class TractDesktopParameterNode:
     """
 
     inputVolume: vtkMRMLScalarVolumeNode
-    imageThreshold: Annotated[float, WithinRange(-100, 500)] = 100
-    invertThreshold: bool = False
-    thresholdedVolume: vtkMRMLScalarVolumeNode
-    invertedVolume: vtkMRMLScalarVolumeNode
+ 
 
 
 #
@@ -168,7 +135,10 @@ class TractDesktopWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
 
         # Buttons
-        self.ui.applyButton.connect("clicked(bool)", self.onApplyButton)
+        self.ui.startTractography.clicked.connect(self.logic.onStartTractography)
+        self.ui.endTractography.clicked.connect(self.logic.onEndTractography)
+
+        
 
         # Make sure parameter node is initialized (needed for module reload)
         self.initializeParameterNode()
@@ -224,33 +194,7 @@ class TractDesktopWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
             self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
         self._parameterNode = inputParameterNode
-        if self._parameterNode:
-            # Note: in the .ui file, a Qt dynamic property called "SlicerParameterName" is set on each
-            # ui element that needs connection.
-            self._parameterNodeGuiTag = self._parameterNode.connectGui(self.ui)
-            self.addObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
-            self._checkCanApply()
-
-    def _checkCanApply(self, caller=None, event=None) -> None:
-        if self._parameterNode and self._parameterNode.inputVolume and self._parameterNode.thresholdedVolume:
-            self.ui.applyButton.toolTip = _("Compute output volume")
-            self.ui.applyButton.enabled = True
-        else:
-            self.ui.applyButton.toolTip = _("Select input and output volume nodes")
-            self.ui.applyButton.enabled = False
-
-    def onApplyButton(self) -> None:
-        """Run processing when user clicks "Apply" button."""
-        with slicer.util.tryWithErrorDisplay(_("Failed to compute results."), waitCursor=True):
-            # Compute output
-            self.logic.process(self.ui.inputSelector.currentNode(), self.ui.outputSelector.currentNode(),
-                               self.ui.imageThresholdSliderWidget.value, self.ui.invertOutputCheckBox.checked)
-
-            # Compute inverted output (if needed)
-            if self.ui.invertedOutputSelector.currentNode():
-                # If additional output volume is selected then result with inverted threshold is written there
-                self.logic.process(self.ui.inputSelector.currentNode(), self.ui.invertedOutputSelector.currentNode(),
-                                   self.ui.imageThresholdSliderWidget.value, not self.ui.invertOutputCheckBox.checked, showResult=False)
+        
 
 
 #
@@ -271,48 +215,108 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
     def __init__(self) -> None:
         """Called when the logic class is instantiated. Can be used for initializing member variables."""
         ScriptedLoadableModuleLogic.__init__(self)
+        self.startTime = None
+        self.roiMoveCount = 0
+        self.updateClickCount = 0
+        self.timerRunning = False
+        self.roiObserver = None
 
     def getParameterNode(self):
         return TractDesktopParameterNode(super().getParameterNode())
 
-    def process(self,
-                inputVolume: vtkMRMLScalarVolumeNode,
-                outputVolume: vtkMRMLScalarVolumeNode,
-                imageThreshold: float,
-                invert: bool = False,
-                showResult: bool = True) -> None:
-        """
-        Run the processing algorithm.
-        Can be used without GUI widget.
-        :param inputVolume: volume to be thresholded
-        :param outputVolume: thresholding result
-        :param imageThreshold: values above/below this threshold will be set to 0
-        :param invert: if True then values above the threshold will be set to 0, otherwise values below are set to 0
-        :param showResult: show output volume in slice viewers
-        """
+    def onStartTractography(self):
+        if not hasattr(self, 'tractoDisplayWidget'):
+            self.tractoDisplayWidget = slicer.modules.tractographydisplay.createNewWidgetRepresentation()
+            self.tractoDisplayWidget.setWindowFlags(self.tractoDisplayWidget.windowFlags() | Qt.Tool)
 
-        if not inputVolume or not outputVolume:
-            raise ValueError("Input or output volume is invalid")
+            # class ClickOutsideFilter(QObject):
+            #     def __init__(self, parentWidget):
+            #         super().__init__()
+            #         self.parentWidget = parentWidget
 
-        import time
+            #     def eventFilter(self, obj, event):
+            #         if event.type() == QEvent.MouseButtonPress:
+            #             if self.parentWidget.isVisible() and not self.parentWidget.geometry.contains(event.globalPos()):
+            #                 self.parentWidget.close()
+            #         return False
 
-        startTime = time.time()
-        logging.info("Processing started")
+            # self._clickFilter = ClickOutsideFilter(self.tractoDisplayWidget)
+            # QApplication.instance().installEventFilter(self._clickFilter)
 
-        # Compute the thresholded output volume using the "Threshold Scalar Volume" CLI module
-        cliParams = {
-            "InputVolume": inputVolume.GetID(),
-            "OutputVolume": outputVolume.GetID(),
-            "ThresholdValue": imageThreshold,
-            "ThresholdType": "Above" if invert else "Below",
-        }
-        cliNode = slicer.cli.run(slicer.modules.thresholdscalarvolume, None, cliParams, wait_for_completion=True, update_display=showResult)
-        # We don't need the CLI module node anymore, remove it to not clutter the scene with it
-        slicer.mrmlScene.RemoveNode(cliNode)
+            # self.tractoDisplayWidget.destroyed.connect(
+            #     lambda: QApplication.instance().removeEventFilter(self._clickFilter)
+            # )
 
-        stopTime = time.time()
-        logging.info(f"Processing completed in {stopTime-startTime:.2f} seconds")
+        self.tractoDisplayWidget.show()
+        self.tractoDisplayWidget.raise_()
 
+        self.startTime = time.perf_counter()
+        self.roiMoveCount = 0
+        self.updateClickCount = 0
+        self.timerRunning = True
+        print("Suivi Tractography démarré")
+
+        # Observer le ROI
+        roiNode = slicer.util.getNode("ROI Node")
+        if self.roiObserver:
+            roiNode.RemoveObserver(self.roiObserver)
+        self.roiObserver = roiNode.AddObserver(
+            slicer.vtkMRMLTransformableNode.TransformModifiedEvent,
+            self.onROIMoved
+            )
+        
+    def onROIMoved(self, caller, event):
+        self.roiMoveCount += 1
+        print(f"ROI déplacé : {self.roiMoveCount}")    
+
+    def onManualUpdateClick(self):
+        self.updateClickCount += 1
+        print(f"Update cliqué : {self.updateClickCount}")
+
+    def onEndTractography(self):
+        print("ok")
+        if not self.timerRunning:
+            slicer.util.warningDisplay("Le suivi n'est pas actif.")
+            return
+
+        self.timerRunning = False
+        duration = time.perf_counter() - self.startTime
+
+        try:
+            fiberNode = slicer.util.getNode("FiberBundle")
+            remaining = fiberNode.GetFilteredPolyData().GetNumberOfLines()
+        except Exception:
+            remaining = "N/A"
+
+        print("Suivi terminé.")
+        print(f"Durée : {duration:.2f}s")
+        print(f"Updates : {self.updateClickCount}")
+        print(f"Déplacements ROI : {self.roiMoveCount}")
+        print(f"Fibres restantes : {remaining}")
+
+        self.saveTractoSession(duration, self.updateClickCount, self.roiMoveCount, remaining)
+
+        # Nettoyer l’observer
+        try:
+            roiNode = slicer.util.getNode("ROI")
+            if self.roiObserver:
+                roiNode.RemoveObserver(self.roiObserver)
+                self.roiObserver = None
+        except:
+            pass
+
+    def saveTractoSession(self, duration, updateClicks, roiMoves, numFibers):
+        logFile = os.path.expanduser("~/Documents/tractography_display_log.csv")
+        fileExists = os.path.isfile(logFile)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with open(logFile, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not fileExists:
+                writer.writerow(["Horodatage", "Durée (s)", "Nb Update", "Déplacements ROI", "Fibres restantes"])
+            writer.writerow([timestamp, f"{duration:.2f}", updateClicks, roiMoves, numFibers])
+
+        slicer.util.infoDisplay(f"  Résultats enregistrés dans : {logFile}")
 
 #
 # TractDesktopTest
