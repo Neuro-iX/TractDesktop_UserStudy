@@ -13,6 +13,7 @@ from slicer.parameterNodeWrapper import (
     parameterNodeWrapper,
     WithinRange,
 )
+import qt
 from qt import QWidget, QObject, QEvent, QApplication, Qt
 
 from slicer import vtkMRMLScalarVolumeNode
@@ -141,16 +142,16 @@ class TractDesktopWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         
 
         # Make sure parameter node is initialized (needed for module reload)
-        self.initializeParameterNode()
+        # self.initializeParameterNode()
 
     def cleanup(self) -> None:
         """Called when the application closes and the module widget is destroyed."""
         self.removeObservers()
 
-    def enter(self) -> None:
-        """Called each time the user opens this module."""
-        # Make sure parameter node exists and observed
-        self.initializeParameterNode()
+    # def enter(self) -> None:
+    #     """Called each time the user opens this module."""
+    #     # Make sure parameter node exists and observed
+    #     self.initializeParameterNode()
 
     def exit(self) -> None:
         """Called each time the user opens a different module."""
@@ -176,13 +177,13 @@ class TractDesktopWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Parameter node stores all user choices in parameter values, node selections, etc.
         # so that when the scene is saved and reloaded, these settings are restored.
 
-        self.setParameterNode(self.logic.getParameterNode())
+        # self.setParameterNode(self.logic.getParameterNode())
 
         # Select default input nodes if nothing is selected yet to save a few clicks for the user
-        if not self._parameterNode.inputVolume:
-            firstVolumeNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
-            if firstVolumeNode:
-                self._parameterNode.inputVolume = firstVolumeNode
+        # if not self._parameterNode.inputVolume:
+        #     firstVolumeNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
+        #     if firstVolumeNode:
+        #         self._parameterNode.inputVolume = firstVolumeNode
 
     def setParameterNode(self, inputParameterNode: Optional[TractDesktopParameterNode]) -> None:
         """
@@ -190,10 +191,10 @@ class TractDesktopWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         Observation is needed because when the parameter node is changed then the GUI must be updated immediately.
         """
 
-        if self._parameterNode:
-            self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
-            self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
-        self._parameterNode = inputParameterNode
+        # if self._parameterNode:
+        #     self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
+        #     self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
+        # self._parameterNode = inputParameterNode
         
 
 
@@ -219,51 +220,58 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         self.roiMoveCount = 0
         self.updateClickCount = 0
         self.timerRunning = False
+        self.roiNode = None
         self.roiObserver = None
+        self.tractoDisplayWidget = None
 
     def getParameterNode(self):
         return TractDesktopParameterNode(super().getParameterNode())
 
     def onStartTractography(self):
-        if not hasattr(self, 'tractoDisplayWidget'):
+        self.showTractographyWindow()
+        if not self.timerRunning:
+            self.startTracking()
+
+
+    def showTractographyWindow(self):
+        if self.tractoDisplayWidget is None:
             self.tractoDisplayWidget = slicer.modules.tractographydisplay.createNewWidgetRepresentation()
-            self.tractoDisplayWidget.setWindowFlags(self.tractoDisplayWidget.windowFlags() | Qt.Tool)
+            flags = self.tractoDisplayWidget.windowFlags()
+            self.tractoDisplayWidget.setWindowFlags(flags | Qt.Tool | Qt.WindowStaysOnTopHint)
 
-            # class ClickOutsideFilter(QObject):
-            #     def __init__(self, parentWidget):
-            #         super().__init__()
-            #         self.parentWidget = parentWidget
-
-            #     def eventFilter(self, obj, event):
-            #         if event.type() == QEvent.MouseButtonPress:
-            #             if self.parentWidget.isVisible() and not self.parentWidget.geometry.contains(event.globalPos()):
-            #                 self.parentWidget.close()
-            #         return False
-
-            # self._clickFilter = ClickOutsideFilter(self.tractoDisplayWidget)
-            # QApplication.instance().installEventFilter(self._clickFilter)
-
-            # self.tractoDisplayWidget.destroyed.connect(
-            #     lambda: QApplication.instance().removeEventFilter(self._clickFilter)
-            # )
-
+            updateButton = self.tractoDisplayWidget.findChild(qt.QPushButton, "UpdateBundleFromSelection")  
+            if updateButton:
+                updateButton.clicked.connect(self.onManualUpdateClick)
+        
         self.tractoDisplayWidget.show()
         self.tractoDisplayWidget.raise_()
 
+
+    def startTracking(self):
         self.startTime = time.perf_counter()
         self.roiMoveCount = 0
         self.updateClickCount = 0
         self.timerRunning = True
-        print("Suivi Tractography démarré")
 
-        # Observer le ROI
-        roiNode = slicer.util.getNode("ROI Node")
+        # Récupérer un Markups ROI (peu importe le nom)
+        self.roiNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLMarkupsROINode")
+        if not self.roiNode:
+            self.timerRunning = False
+            return
+
+        # Nettoyer un ancien observer si existant
         if self.roiObserver:
-            roiNode.RemoveObserver(self.roiObserver)
-        self.roiObserver = roiNode.AddObserver(
-            slicer.vtkMRMLTransformableNode.TransformModifiedEvent,
+            try:
+                self.roiNode.RemoveObserver(self.roiObserver)
+            except Exception:
+                pass
+            self.roiObserver = None
+
+        # Observer un événement Markups (pas TransformModifiedEvent)
+        # PointModifiedEvent = bouge/redimensionne le ROI
+        self.roiObserver = self.roiNode.AddObserver(slicer.vtkMRMLMarkupsNode.PointModifiedEvent,
             self.onROIMoved
-            )
+        )
         
     def onROIMoved(self, caller, event):
         self.roiMoveCount += 1
@@ -298,7 +306,7 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
 
         # Nettoyer l’observer
         try:
-            roiNode = slicer.util.getNode("ROI")
+            roiNode = slicer.util.getNode("ROI Node")
             if self.roiObserver:
                 roiNode.RemoveObserver(self.roiObserver)
                 self.roiObserver = None
