@@ -223,6 +223,12 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         self.roiNode = None
         self.roiObserver = None
         self.tractoDisplayWidget = None
+        self.roiObserverStart = None      
+        self.roiObserverEnd = None        
+        self.roiInteractionCount = 0      
+        self._inDrag = False              
+        self._currentStart = None         
+        self._interactionDurations = [] 
 
     def getParameterNode(self):
         return TractDesktopParameterNode(super().getParameterNode())
@@ -251,6 +257,8 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         self.startTime = time.perf_counter()
         self.roiMoveCount = 0
         self.updateClickCount = 0
+        self.roiInteractionCount = 0          
+        self._interactionDurations = []
         self.timerRunning = True
 
         # Récupérer un Markups ROI (peu importe le nom)
@@ -260,22 +268,38 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
             return
 
         # Nettoyer un ancien observer si existant
-        if self.roiObserver:
-            try:
-                self.roiNode.RemoveObserver(self.roiObserver)
-            except Exception:
-                pass
-            self.roiObserver = None
+        for oid in (self.roiObserverStart, self.roiObserver, self.roiObserverEnd):
+            if oid and self.roiNode:
+                try:
+                    self.roiNode.RemoveObserver(oid)
+                except Exception:
+                    pass
+        self.roiObserverStart = self.roiObserver = self.roiObserverEnd = None
 
         # Observer un événement Markups (pas TransformModifiedEvent)
         # PointModifiedEvent = bouge/redimensionne le ROI
-        self.roiObserver = self.roiNode.AddObserver(slicer.vtkMRMLMarkupsNode.PointModifiedEvent,
-            self.onROIMoved
-        )
-        
+        mrk = slicer.vtkMRMLMarkupsNode  
+        self.roiObserverStart = self.roiNode.AddObserver(mrk.PointStartInteractionEvent, self.onROIStart)  
+        self.roiObserver      = self.roiNode.AddObserver(mrk.PointModifiedEvent,         self.onROIMoved) 
+        self.roiObserverEnd   = self.roiNode.AddObserver(mrk.PointEndInteractionEvent,   self.onROIEnd)   
+            
     def onROIMoved(self, caller, event):
         self.roiMoveCount += 1
         print(f"ROI déplacé : {self.roiMoveCount}")    
+
+    def onROIStart(self, caller, event):           
+        if not self._inDrag:
+            self._inDrag = True
+            self.roiInteractionCount += 1
+            self._currentStart = time.perf_counter()
+
+    def onROIEnd(self, caller, event):             
+        if self._inDrag:
+            end = time.perf_counter()
+            if self._currentStart is not None:
+                self._interactionDurations.append(end - self._currentStart)
+            self._inDrag = False
+            self._currentStart = None
 
     def onManualUpdateClick(self):
         self.updateClickCount += 1
@@ -296,22 +320,27 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         except Exception:
             remaining = "N/A"
 
+        avg = (sum(self._interactionDurations)/len(self._interactionDurations)) if self._interactionDurations else 0.0  # NEW
+
         print("Suivi terminé.")
         print(f"Durée : {duration:.2f}s")
         print(f"Updates : {self.updateClickCount}")
+        print(f"Interactions ROI (clic→relâche) : {self.roiInteractionCount}")                # NEW
+        print(f"Durée moyenne par interaction : {avg:.2f}s")                                 # NEW
         print(f"Déplacements ROI : {self.roiMoveCount}")
         print(f"Fibres restantes : {remaining}")
 
         self.saveTractoSession(duration, self.updateClickCount, self.roiMoveCount, remaining)
 
-        # Nettoyer l’observer
+        # --- Nettoyer les 3 observers proprement ---
         try:
-            roiNode = slicer.util.getNode("ROI Node")
-            if self.roiObserver:
-                roiNode.RemoveObserver(self.roiObserver)
-                self.roiObserver = None
-        except:
+            if self.roiNode:
+                for oid in (self.roiObserverStart, self.roiObserver, self.roiObserverEnd):
+                    if oid:
+                        self.roiNode.RemoveObserver(oid)
+        except Exception:
             pass
+        self.roiObserverStart = self.roiObserver = self.roiObserverEnd = None
 
     def saveTractoSession(self, duration, updateClicks, roiMoves, numFibers):
         logFile = os.path.expanduser("~/Documents/tractography_display_log.csv")
