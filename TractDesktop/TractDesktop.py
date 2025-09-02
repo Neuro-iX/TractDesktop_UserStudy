@@ -229,9 +229,68 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         self._inDrag = False              
         self._currentStart = None         
         self._interactionDurations = [] 
+        self.roiDistanceMm = 0.0
+        self._lastCenterWorld = None
+        self._epsilon = 0.05  
+        self._parentTransformNode = None
+        self._parentTransformObs = []
+
+        self.cameraNode = None
+        self._camObs = None
+        self.camTransMm = 0.0
+        self.camRotDeg = 0.0
+        self._camLastPos = None
+        self._camLastDir = None
+        self._camEpsMm = 0.05
+        self._camEpsDeg = 0.05
 
     def getParameterNode(self):
         return TractDesktopParameterNode(super().getParameterNode())
+
+    def _getActiveCameraNode(self):
+        try:
+            lm = slicer.app.layoutManager()
+            view = lm.threeDWidget(0).threeDView()
+            viewNode = view.mrmlViewNode()
+            return slicer.modules.cameras.logic().GetViewActiveCameraNode(viewNode)
+        except Exception:
+            return slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLCameraNode")
+
+    @staticmethod
+    def _norm(v):
+        import math
+        return math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2])
+
+    @staticmethod
+    def _angle_deg(u, v):
+        import math
+        nu = TractDesktopLogic._norm(u); nv = TractDesktopLogic._norm(v)
+        if nu == 0 or nv == 0: return 0.0
+        dot = u[0]*v[0]+u[1]*v[1]+u[2]*v[2]
+        c = max(-1.0, min(1.0, dot/(nu*nv)))
+        return math.degrees(math.acos(c))
+    
+    def _getRoiCenterWorld(self):
+        c_local = [0.0, 0.0, 0.0]
+        self.roiNode.GetCenter(c_local)
+        tfm = vtk.vtkGeneralTransform()
+        slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(self.roiNode.GetParentTransformNode(), None, tfm)
+        c_world = [0.0, 0.0, 0.0]
+        tfm.TransformPoint(c_local, c_world)
+        return c_world
+
+    def _observeParentTransform(self, enable=True):
+        for n, oid in self._parentTransformObs:
+            try:
+                if n and oid: n.RemoveObserver(oid)
+            except: pass
+        self._parentTransformObs = []
+        self._parentTransformNode = self.roiNode.GetParentTransformNode()
+
+        if enable and self._parentTransformNode:
+            cb = self.onROIMaybeMovedByTransform
+            self._parentTransformObs.append((self._parentTransformNode, self._parentTransformNode.AddObserver(vtk.vtkCommand.ModifiedEvent, cb)))
+            self._parentTransformObs.append((self._parentTransformNode, self._parentTransformNode.AddObserver(slicer.vtkMRMLTransformableNode.TransformModifiedEvent, cb)))
 
     def onStartTractography(self):
         self.showTractographyWindow()
@@ -260,6 +319,8 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         self.roiInteractionCount = 0          
         self._interactionDurations = []
         self.timerRunning = True
+        self.roiDistanceMm = 0.0
+        self._lastCenterWorld = None
 
         # Récupérer un Markups ROI (peu importe le nom)
         self.roiNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLMarkupsROINode")
@@ -282,16 +343,71 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         self.roiObserverStart = self.roiNode.AddObserver(mrk.PointStartInteractionEvent, self.onROIStart)  
         self.roiObserver      = self.roiNode.AddObserver(mrk.PointModifiedEvent,         self.onROIMoved) 
         self.roiObserverEnd   = self.roiNode.AddObserver(mrk.PointEndInteractionEvent,   self.onROIEnd)   
-            
+        self._observeParentTransform(enable=True)
+
+         # --- Camera tracking ---
+        self.camTransMm = 0.0
+        self.camRotDeg = 0.0
+        self._camLastPos = None
+        self._camLastDir = None
+
+        self.cameraNode = self._getActiveCameraNode()
+        if self.cameraNode and not self._camObs:
+            self._camObs = self.cameraNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onCameraModified)
+
+        # seed initial pose
+        if self.cameraNode:
+            cam = self.cameraNode.GetCamera()
+            p = cam.GetPosition()
+            f = cam.GetFocalPoint()
+            self._camLastPos = (p[0], p[1], p[2])
+            self._camLastDir = (f[0]-p[0], f[1]-p[1], f[2]-p[2])
+
+    def onCameraModified(self, caller, event):
+        if not self.cameraNode: return
+        cam = self.cameraNode.GetCamera()
+        p = cam.GetPosition()
+        f = cam.GetFocalPoint()
+        pos = (p[0], p[1], p[2])
+        dvec = (f[0]-p[0], f[1]-p[1], f[2]-p[2])
+
+        # translation
+        if self._camLastPos is not None:
+            dp = (pos[0]-self._camLastPos[0], pos[1]-self._camLastPos[1], pos[2]-self._camLastPos[2])
+            dmm = self._norm(dp)
+            if dmm > self._camEpsMm:
+                self.camTransMm += dmm
+                self._camLastPos = pos
+        else:
+            self._camLastPos = pos
+
+        # rotation (changement d'axe de visée)
+        if self._camLastDir is not None:
+            ddeg = self._angle_deg(self._camLastDir, dvec)
+            if ddeg > self._camEpsDeg:
+                self.camRotDeg += ddeg
+                self._camLastDir = dvec
+        else:
+            self._camLastDir = dvec
+    
     def onROIMoved(self, caller, event):
         self.roiMoveCount += 1
-        print(f"ROI déplacé : {self.roiMoveCount}")    
+        c = self._getRoiCenterWorld()
+        if self._lastCenterWorld is not None:
+            dx = c[0]-self._lastCenterWorld[0]; dy = c[1]-self._lastCenterWorld[1]; dz = c[2]-self._lastCenterWorld[2]
+            d = (dx*dx + dy*dy + dz*dz) ** 0.5
+            if d > self._epsilon:
+                self.roiDistanceMm += d
+                self._lastCenterWorld = c
+        print(f"ROI déplacé : {self.roiMoveCount}")
+         
 
     def onROIStart(self, caller, event):           
         if not self._inDrag:
             self._inDrag = True
             self.roiInteractionCount += 1
             self._currentStart = time.perf_counter()
+            self._lastCenterWorld = self._getRoiCenterWorld()
 
     def onROIEnd(self, caller, event):             
         if self._inDrag:
@@ -300,6 +416,17 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
                 self._interactionDurations.append(end - self._currentStart)
             self._inDrag = False
             self._currentStart = None
+
+    def onROIMaybeMovedByTransform(self, caller, event):
+        c = self._getRoiCenterWorld()
+        if self._lastCenterWorld is None:
+            self._lastCenterWorld = c
+            return
+        dx = c[0]-self._lastCenterWorld[0]; dy = c[1]-self._lastCenterWorld[1]; dz = c[2]-self._lastCenterWorld[2]
+        d = (dx*dx + dy*dy + dz*dz) ** 0.5
+        if d > self._epsilon:
+            self.roiDistanceMm += d
+            self._lastCenterWorld = c
 
     def onManualUpdateClick(self):
         self.updateClickCount += 1
@@ -328,9 +455,21 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         print(f"Interactions ROI (clic→relâche) : {self.roiInteractionCount}")                # NEW
         print(f"Durée moyenne par interaction : {avg:.2f}s")                                 # NEW
         print(f"Déplacements ROI : {self.roiMoveCount}")
+        print(f"Distance ROI (mm) : {self.roiDistanceMm:.2f}")
         print(f"Fibres restantes : {remaining}")
+        print(f"Caméra — translation cumulée : {self.camTransMm:.2f} mm")
+        print(f"Caméra — rotation cumulée : {self.camRotDeg:.2f} °")
 
-        self.saveTractoSession(duration, self.updateClickCount, self.roiMoveCount, remaining)
+        self.saveTractoSession(duration, self.updateClickCount, self.roiMoveCount, remaining, self.roiDistanceMm, self.camTransMm, self.camRotDeg)
+
+        # remove camera observer
+        try:
+            if self.cameraNode and self._camObs:
+                self.cameraNode.RemoveObserver(self._camObs)
+        except Exception:
+            pass
+        self._camObs = None
+        self.cameraNode = None
 
         # --- Nettoyer les 3 observers proprement ---
         try:
@@ -342,20 +481,20 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
             pass
         self.roiObserverStart = self.roiObserver = self.roiObserverEnd = None
 
-    def saveTractoSession(self, duration, updateClicks, roiMoves, numFibers):
+    
+        self._observeParentTransform(enable=False)
+
+    def saveTractoSession(self, duration, updateClicks, roiMoves, numFibers, roiDistanceMm, camTransMm, camRotDeg):
         logFile = os.path.expanduser("~/Documents/tractography_display_log.csv")
         fileExists = os.path.isfile(logFile)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         with open(logFile, "a", newline="") as f:
             writer = csv.writer(f)
             if not fileExists:
-                writer.writerow(["Horodatage", "Durée (s)", "Nb Update", "Déplacements ROI", "Fibres restantes"])
-            writer.writerow([timestamp, f"{duration:.2f}", updateClicks, roiMoves, numFibers])
-
+                writer.writerow(["Horodatage", "Durée (s)", "Nb Update", "Déplacements ROI", "Fibres restantes", "Distance ROI (mm)", "Cam trans (mm)", "Cam rot (deg)"])
+            writer.writerow([timestamp, f"{duration:.2f}", updateClicks, roiMoves, numFibers, f"{roiDistanceMm:.2f}", f"{camTransMm:.2f}", f"{camRotDeg:.2f}"])
         slicer.util.infoDisplay(f"  Résultats enregistrés dans : {logFile}")
-
-#
+        
 # TractDesktopTest
 #
 
