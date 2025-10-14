@@ -337,8 +337,7 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
                     pass
         self.roiObserverStart = self.roiObserver = self.roiObserverEnd = None
 
-        # Observer un événement Markups (pas TransformModifiedEvent)
-        # PointModifiedEvent = bouge/redimensionne le ROI
+
         mrk = slicer.vtkMRMLMarkupsNode  
         self.roiObserverStart = self.roiNode.AddObserver(mrk.PointStartInteractionEvent, self.onROIStart)  
         self.roiObserver      = self.roiNode.AddObserver(mrk.PointModifiedEvent,         self.onROIMoved) 
@@ -460,7 +459,7 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         print(f"Caméra — translation cumulée : {self.camTransMm:.2f} mm")
         print(f"Caméra — rotation cumulée : {self.camRotDeg:.2f} °")
 
-        self.saveTractoSession(duration, self.updateClickCount, self.roiMoveCount, remaining, self.roiDistanceMm, self.camTransMm, self.camRotDeg)
+        self.saveTractoSession(duration, self.updateClickCount, self.roiMoveCount, self.roiInteractionCount, remaining, self.roiDistanceMm, self.camTransMm, self.camRotDeg)
 
         # remove camera observer
         try:
@@ -484,15 +483,15 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
     
         self._observeParentTransform(enable=False)
 
-    def saveTractoSession(self, duration, updateClicks, roiMoves, numFibers, roiDistanceMm, camTransMm, camRotDeg):
+    def saveTractoSession(self, duration, updateClicks, roiMoves, roiInteraction, numFibers, roiDistanceMm, camTransMm, camRotDeg):
         logFile = os.path.expanduser("~/Documents/tractography_display_log.csv")
         fileExists = os.path.isfile(logFile)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(logFile, "a", newline="") as f:
             writer = csv.writer(f)
             if not fileExists:
-                writer.writerow(["Horodatage", "Durée (s)", "Nb Update", "Déplacements ROI", "Fibres restantes", "Distance ROI (mm)", "Cam trans (mm)", "Cam rot (deg)"])
-            writer.writerow([timestamp, f"{duration:.2f}", updateClicks, roiMoves, numFibers, f"{roiDistanceMm:.2f}", f"{camTransMm:.2f}", f"{camRotDeg:.2f}"])
+                writer.writerow(["Horodatage", "Duree (s)", "Nb Update", "Deplacements ROI", "Nb Interaction", "Fibres restantes", "Distance ROI (mm)", "Cam trans (mm)", "Cam rot (deg)"])
+            writer.writerow([timestamp, f"{duration:.2f}", updateClicks, roiMoves, roiInteraction, numFibers, f"{roiDistanceMm:.2f}", f"{camTransMm:.2f}", f"{camRotDeg:.2f}"])
         slicer.util.infoDisplay(f"  Résultats enregistrés dans : {logFile}")
         
 # TractDesktopTest
