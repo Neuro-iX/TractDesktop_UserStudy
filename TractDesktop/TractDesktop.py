@@ -20,6 +20,15 @@ from slicer import vtkMRMLScalarVolumeNode
 from datetime import datetime
 import time
 import csv
+import json
+
+APP_DATA_DIR = os.path.join(slicer.app.defaultSettingsDirectory, "TractVRRandomization")
+PID_JSON_DIR = os.path.join(APP_DATA_DIR, "by-participant")
+PROGRESS_DIR = os.path.join(APP_DATA_DIR, "progress")
+PERF_DIR = os.path.join(APP_DATA_DIR, "performance")
+os.makedirs(PID_JSON_DIR, exist_ok=True)
+os.makedirs(PROGRESS_DIR, exist_ok=True)
+os.makedirs(PERF_DIR, exist_ok=True)
 
 
 #
@@ -91,6 +100,43 @@ class TractDesktopParameterNode:
     inputVolume: vtkMRMLScalarVolumeNode
  
 
+# ----------------------------------------------------------------------
+# Helpers randomisation + progression (=== NEW)
+# ----------------------------------------------------------------------
+def _alloc_json(pid: str):
+    """Charge le JSON d'allocation par participant (généré par TractRandomizer)."""
+    path = os.path.join(PID_JSON_DIR, f"{pid}.json")
+    return json.load(open(path, "r", encoding="utf-8")) if os.path.exists(path) else None
+
+def _progress_path(pid: str, session: int) -> str:
+    return os.path.join(PROGRESS_DIR, f"{pid}_S{session}.json")
+
+def _load_progress(pid: str, session: int):
+    """Charge la progression (index courant + timestamps) ; sinon init index=0."""
+    path = _progress_path(pid, session)
+    if os.path.exists(path):
+        return json.load(open(path, "r", encoding="utf-8"))
+    return {"pid": pid, "session": session, "index": 0, "timestamps": []}
+
+def _save_progress(prog: dict):
+    with open(_progress_path(prog["pid"], prog["session"]), "w", encoding="utf-8") as f:
+        json.dump(prog, f, indent=2, ensure_ascii=False)
+
+def _per_case_csv(pid: str, session: int) -> str:
+    return os.path.join(PERF_DIR, f"{pid}_S{session}_cases.csv")
+
+def _ensure_per_case_header(path: str):
+    """Crée l'en-tête du CSV par cas si inexistant."""
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "Horodatage_debut","Horodatage_fin",
+                "ParticipantID","Session","CaseIndex","CaseName",
+                "Duree_s","NbUpdate","NbInteraction","Deplacements_ROI",
+                "Distance_ROI_mm","CamTrans_mm","CamRot_deg","Fibres_restantes"
+            ])
+
 
 #
 # TractDesktopWidget
@@ -138,6 +184,8 @@ class TractDesktopWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Buttons
         self.ui.startTractography.clicked.connect(self.logic.onStartTractography)
         self.ui.endTractography.clicked.connect(self.logic.onEndTractography)
+        self.ui.nextCase.clicked.connect(self.logic.onNextCase)
+        self.ui.loadStudy.clicked.connect(self.logic.onLoadStudy)
 
         
 
@@ -244,6 +292,15 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         self._camEpsMm = 0.05
         self._camEpsDeg = 0.05
 
+        # === NEW: État randomisation + cas courant + totaux de session ===
+        self._pid = None                  # Participant ID courant
+        self._session = None              # 1 ou 2
+        self._caseList = []               # Liste ordonnée des cas pour la session
+        self._prog = None                 # dict: {"pid","session","index","timestamps":[]}
+        self._currentCaseName = None      # Nom du cas courant
+        self._caseStartPerf = None        # perf_counter() au début de ce cas
+        self._caseStartIso = None         # horodatage ISO humain au début de ce cas
+
     def getParameterNode(self):
         return TractDesktopParameterNode(super().getParameterNode())
 
@@ -291,6 +348,74 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
             cb = self.onROIMaybeMovedByTransform
             self._parentTransformObs.append((self._parentTransformNode, self._parentTransformNode.AddObserver(vtk.vtkCommand.ModifiedEvent, cb)))
             self._parentTransformObs.append((self._parentTransformNode, self._parentTransformNode.AddObserver(slicer.vtkMRMLTransformableNode.TransformModifiedEvent, cb)))
+
+    def _now_iso(self):
+        return datetime.now().isoformat(timespec="seconds")
+    
+    def onLoadStudy(self):
+        print("ici charger randomisation csv")
+        # 1) Participant ID
+        pid, ok = qt.QInputDialog.getText(slicer.util.mainWindow(), "Charger plan randomisé",
+                                          "Participant ID (ex. P20251110-001):")
+        if not ok or not pid.strip():
+            return
+        pid = pid.strip()
+
+        # 2) Session (1 ou 2)
+        session, ok = qt.QInputDialog.getInt(slicer.util.mainWindow(), "Session",
+                                             "Session (1 ou 2):", 1, 1, 2, 1)
+        if not ok:
+            return
+
+        # 3) Allocation depuis JSON
+        alloc = _alloc_json(pid)
+        if not alloc:
+            slicer.util.errorDisplay(f"Aucune randomisation trouvée pour {pid}.\n"
+                                     f"Génère-la d abord dans le module TractRandomizer.")
+            return
+
+        if session == 1:
+            mode = alloc.get("Session1_Mode", "Desktop")
+            cases = alloc.get("Session1_TaskOrder", [])
+        else:
+            mode = alloc.get("Session2_Mode", "VR")
+            cases = alloc.get("Session2_TaskOrder", [])
+
+        # 4) Vérif mode attendu
+        if mode != "Desktop":
+            slicer.util.warningDisplay(
+                f"Attention : pour {pid} (Session {session}), le mode attendu est {mode}.\n"
+                f"Tu es dans TractDesktop. (Ok pour tester, sinon ouvre {mode})."
+            )
+
+        # 5) Mémoriser état, progression et totaux de session
+        self._pid = pid
+        self._session = session
+        self._caseList = list(cases)
+        self._prog = _load_progress(pid, session)
+
+        if not self._caseList:
+            slicer.util.errorDisplay("La liste des cas est vide dans le JSON.")
+            return
+
+        # Reset des totaux session
+        self._tot_updates = self._tot_interactions = self._tot_roiMoves = 0
+        self._tot_roiDist = self._tot_camTrans = self._tot_camRot = 0.0
+
+        # 6) Afficher cas courant (reprend index sauvegardé)
+        idx = max(0, min(self._prog["index"], len(self._caseList)-1))
+        self._prog["index"] = idx; _save_progress(self._prog)
+        currentName = self._caseList[idx]
+
+        # Démarrer mesures par cas + afficher
+        self._beginCase(currentName)         # === NEW
+        self.loadOneCase(currentName)        # === NEW (hook affichage)
+        print(f"[TractDesktop] Plan chargé {pid} S{session} — Cas {idx+1}/{len(self._caseList)} : {currentName}")
+
+        slicer.util.infoDisplay(
+            f"Plan chargé pour {pid} (Session {session}).\nOrdre: {', '.join(self._caseList)}",
+            windowTitle="TractDesktop"
+        )
 
     def onStartTractography(self):
         self.showTractographyWindow()
@@ -431,6 +556,121 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         self.updateClickCount += 1
         print(f"Update cliqué : {self.updateClickCount}")
 
+    # ------------------------------------------------------------------
+    # Gestion PAR CAS (=== NEW)
+    # ------------------------------------------------------------------
+    def _beginCase(self, caseName: str):
+        """Démarre un nouveau cas : reset des compteurs PAR CAS + seeds caméra."""
+        self._currentCaseName = caseName
+        self._caseStartPerf = time.perf_counter()
+        self._caseStartIso = self._now_iso()
+
+        # Reset per-case (mesure uniquement ce cas)
+        self.roiMoveCount = 0
+        self.updateClickCount = 0
+        self.roiInteractionCount = 0
+        self._interactionDurations = []
+        self.roiDistanceMm = 0.0
+        self._lastCenterWorld = None
+
+        # Camera per-case reset
+        self.camTransMm = 0.0
+        self.camRotDeg = 0.0
+        self._camLastPos = None
+        self._camLastDir = None
+
+        self.cameraNode = self._getActiveCameraNode()
+        if self.cameraNode and not self._camObs:
+            self._camObs = self.cameraNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onCameraModified)
+        if self.cameraNode:
+            cam = self.cameraNode.GetCamera()
+            p = cam.GetPosition(); f = cam.GetFocalPoint()
+            self._camLastPos = (p[0], p[1], p[2])
+            self._camLastDir = (f[0]-p[0], f[1]-p[1], f[2]-p[2])
+
+    def _snapshotCaseMetrics(self) -> dict:
+        """Capture les métriques actuelles pour le cas courant (sans effet de bord)."""
+        duration = (time.perf_counter() - self._caseStartPerf) if self._caseStartPerf else 0.0
+        try:
+            fiberNode = slicer.util.getNode("FiberBundle")
+            remaining = fiberNode.GetFilteredPolyData().GetNumberOfLines()
+        except Exception:
+            remaining = "N/A"
+        avg_inter = (sum(self._interactionDurations)/len(self._interactionDurations)
+                     if self._interactionDurations else 0.0)
+        return {
+            "duration": duration,
+            "updates": self.updateClickCount,
+            "interactions": self.roiInteractionCount,
+            "roiMoves": self.roiMoveCount,
+            "roiDist": self.roiDistanceMm,
+            "camTrans": self.camTransMm,
+            "camRot": self.camRotDeg,
+            "remaining": remaining,
+            "startIso": self._caseStartIso,
+            "endIso": self._now_iso(),
+            "caseName": self._currentCaseName,
+            "avgInteract": avg_inter,
+        }
+
+    def _endCase(self, save=True):
+        """Clôt le cas courant : enregistre dans le CSV PAR CAS puis reset pointeurs cas."""
+        if not self._currentCaseName:
+            return
+        m = self._snapshotCaseMetrics()
+
+        if save and self._pid and self._session is not None and self._prog is not None:
+            path = _per_case_csv(self._pid, self._session)
+            _ensure_per_case_header(path)
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    m["startIso"], m["endIso"],
+                    self._pid, self._session,
+                    self._prog["index"], m["caseName"],
+                    f"{m['duration']:.2f}", m["updates"], m["interactions"], m["roiMoves"],
+                    f"{m['roiDist']:.2f}", f"{m['camTrans']:.2f}", f"{m['camRot']:.2f}", m["remaining"]
+                ])
+            print(f"[TractDesktop] Cas sauvegardé: {self._pid} S{self._session} idx {self._prog['index']} {m['caseName']}")
+
+            self.saveTractoSession(
+                m["duration"], m["updates"], m["roiMoves"], m["interactions"],
+                m["remaining"], m["roiDist"], m["camTrans"], m["camRot"]
+            )
+
+        # Reset signaux cas courant
+        self._currentCaseName = None
+        self._caseStartPerf = None
+        self._caseStartIso = None
+
+
+
+
+    def onNextCase(self):
+        print("ici nouveau code")
+        if self._prog is None or not self._caseList:
+            slicer.util.warningDisplay("Aucun plan chargé. Clique d’abord sur « loadStudy »."); 
+            return
+
+        # 1) Sauvegarder le cas courant
+        self._endCase(save=True)
+
+        # 2) Aller au suivant
+        if self._prog["index"] >= len(self._caseList) - 1:
+            slicer.util.infoDisplay("Dernier cas atteint. Utilise « End » pour terminer la session.")
+            return
+
+        self._prog["index"] += 1
+        self._prog["timestamps"].append({"event":"next","t":self._now_iso(),"idx":self._prog["index"]})
+        _save_progress(self._prog)
+
+        # 3) Démarrer + afficher
+        nextName = self._caseList[self._prog["index"]]
+        self._beginCase(nextName)
+        self.loadOneCase(nextName)
+        print(f"[TractDesktop] → Cas {self._prog['index']+1}/{len(self._caseList)} : {nextName}")
+
+
     def onEndTractography(self):
         print("ok")
         if not self.timerRunning:
@@ -493,6 +733,22 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
                 writer.writerow(["Horodatage", "Duree (s)", "Nb Update", "Deplacements ROI", "Nb Interaction", "Fibres restantes", "Distance ROI (mm)", "Cam trans (mm)", "Cam rot (deg)"])
             writer.writerow([timestamp, f"{duration:.2f}", updateClicks, roiMoves, roiInteraction, numFibers, f"{roiDistanceMm:.2f}", f"{camTransMm:.2f}", f"{camRotDeg:.2f}"])
         slicer.util.infoDisplay(f"  Résultats enregistrés dans : {logFile}")
+
+    def loadOneCase(self, caseName: str):
+        """
+        Branche ici TON pipeline d'affichage pour un faisceau/dataset nommé `caseName`.
+        Exemple minimal : rendre visible un nœud 'caseName' s'il existe.
+        Remplace par ta logique (FiberBundleNode, Segmentation, Models, etc.).
+        """
+        try:
+            node = slicer.util.getFirstNodeByName(caseName)
+            if node and hasattr(node, "GetDisplayNode") and node.GetDisplayNode():
+                node.GetDisplayNode().SetVisibility(1)
+            else:
+                print(f"[TractDesktop] Astuce: crée/nomme un nœud '{caseName}' dans la scène pour l'afficher automatiquement.")
+        except Exception as e:
+            slicer.util.warningDisplay(f"Impossible d'afficher le cas '{caseName}' : {e}")
+
         
 # TractDesktopTest
 #
