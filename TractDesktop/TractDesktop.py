@@ -1,6 +1,7 @@
 import logging
 import os
 from typing import Annotated, Optional
+from typing import Dict, List
 
 import vtk
 
@@ -21,8 +22,12 @@ from datetime import datetime
 import time
 import csv
 import json
+from qt import QStandardPaths
 
-APP_DATA_DIR = os.path.join(slicer.app.defaultSettingsDirectory, "TractVRRandomization")
+APP_DATA_DIR = os.path.join(
+    QStandardPaths.writableLocation(QStandardPaths.AppDataLocation),
+    "TractVRRandomization"
+)
 PID_JSON_DIR = os.path.join(APP_DATA_DIR, "by-participant")
 PROGRESS_DIR = os.path.join(APP_DATA_DIR, "progress")
 PERF_DIR = os.path.join(APP_DATA_DIR, "performance")
@@ -30,6 +35,16 @@ os.makedirs(PID_JSON_DIR, exist_ok=True)
 os.makedirs(PROGRESS_DIR, exist_ok=True)
 os.makedirs(PERF_DIR, exist_ok=True)
 
+def _ask_text(parent, title, label, default=""):
+    """Toujours retourner (text, ok) même si le binding Qt renvoie juste une string."""
+    out = qt.QInputDialog.getText(parent, title, label, qt.QLineEdit.Normal, default)
+    if isinstance(out, tuple):
+        # (text, ok)
+        if len(out) >= 2:
+            return str(out[0]), bool(out[1])
+        return str(out[0]), True
+    # Rare: PySide renvoie une string seule → on considère ok=True si non vide
+    return str(out), True if out else False
 
 #
 # TractDesktop
@@ -244,6 +259,8 @@ class TractDesktopWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         #     self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
         # self._parameterNode = inputParameterNode
         
+    
+
 
 
 #
@@ -292,14 +309,22 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         self._camEpsMm = 0.05
         self._camEpsDeg = 0.05
 
-        # === NEW: État randomisation + cas courant + totaux de session ===
-        self._pid = None                  # Participant ID courant
-        self._session = None              # 1 ou 2
-        self._caseList = []               # Liste ordonnée des cas pour la session
-        self._prog = None                 # dict: {"pid","session","index","timestamps":[]}
-        self._currentCaseName = None      # Nom du cas courant
-        self._caseStartPerf = None        # perf_counter() au début de ce cas
-        self._caseStartIso = None         # horodatage ISO humain au début de ce cas
+        # --- Randomization/plan state ---
+        self._alloc: Optional[Dict] = None     # JSON du participant chargé
+        self._caseOrder: List[str] = []        # ordre des cas pour Desktop
+        self._caseIndex: int = -1              # index courant (avant premier = -1)
+
+        # === NEW ===  Contexte participant + session + progression
+        self._pid: Optional[str] = None
+        self._session: Optional[int] = None
+        self._prog: Optional[Dict] = None
+
+        # === NEW ===  Contexte "cas courant"
+        self._currentCaseName: Optional[str] = None
+        self._caseStartPerf: Optional[float] = None
+        self._caseStartIso: Optional[str] = None
+
+       
 
     def getParameterNode(self):
         return TractDesktopParameterNode(super().getParameterNode())
@@ -353,69 +378,166 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         return datetime.now().isoformat(timespec="seconds")
     
     def onLoadStudy(self):
-        print("ici charger randomisation csv")
-        # 1) Participant ID
-        pid, ok = qt.QInputDialog.getText(slicer.util.mainWindow(), "Charger plan randomisé",
-                                          "Participant ID (ex. P20251110-001):")
+         # Demande PID
+        pid, ok = _ask_text(slicer.util.mainWindow(),
+                            "Charger plan randomisé",
+                            "Participant ID (ex: P20251110-001) :", "")
         if not ok or not pid.strip():
             return
         pid = pid.strip()
 
-        # 2) Session (1 ou 2)
-        session, ok = qt.QInputDialog.getInt(slicer.util.mainWindow(), "Session",
-                                             "Session (1 ou 2):", 1, 1, 2, 1)
-        if not ok:
+        # JSON d'allocation
+        jsonPath = os.path.join(PID_JSON_DIR, pid + ".json")
+        if not os.path.isfile(jsonPath):
+            slicer.util.errorDisplay(f"Plan introuvable : {jsonPath}")
             return
 
-        # 3) Allocation depuis JSON
-        alloc = _alloc_json(pid)
-        if not alloc:
-            slicer.util.errorDisplay(f"Aucune randomisation trouvée pour {pid}.\n"
-                                     f"Génère-la d abord dans le module TractRandomizer.")
+        try:
+            with open(jsonPath, "r", encoding="utf-8") as f:
+                alloc = json.load(f)
+        except Exception as e:
+            slicer.util.errorDisplay(f"Erreur de lecture JSON:\n{e}")
             return
 
-        if session == 1:
-            mode = alloc.get("Session1_Mode", "Desktop")
-            cases = alloc.get("Session1_TaskOrder", [])
-        else:
-            mode = alloc.get("Session2_Mode", "VR")
-            cases = alloc.get("Session2_TaskOrder", [])
-
-        # 4) Vérif mode attendu
-        if mode != "Desktop":
-            slicer.util.warningDisplay(
-                f"Attention : pour {pid} (Session {session}), le mode attendu est {mode}.\n"
-                f"Tu es dans TractDesktop. (Ok pour tester, sinon ouvre {mode})."
-            )
-
-        # 5) Mémoriser état, progression et totaux de session
+        self._alloc = alloc
         self._pid = pid
-        self._session = session
-        self._caseList = list(cases)
-        self._prog = _load_progress(pid, session)
 
-        if not self._caseList:
-            slicer.util.errorDisplay("La liste des cas est vide dans le JSON.")
+        # === NEW ===  Quelle session est Desktop ?
+        if alloc.get("Session1_Mode") == "Desktop":
+            self._session = 1
+            order = alloc.get("Session1_TaskOrder", [])
+        else:
+            self._session = 2
+            order = alloc.get("Session2_TaskOrder", [])
+
+        if not order:
+            slicer.util.errorDisplay("Aucun ordre de cas trouvé dans le plan.")
             return
 
-        # Reset des totaux session
-        self._tot_updates = self._tot_interactions = self._tot_roiMoves = 0
-        self._tot_roiDist = self._tot_camTrans = self._tot_camRot = 0.0
-
-        # 6) Afficher cas courant (reprend index sauvegardé)
-        idx = max(0, min(self._prog["index"], len(self._caseList)-1))
-        self._prog["index"] = idx; _save_progress(self._prog)
-        currentName = self._caseList[idx]
-
-        # Démarrer mesures par cas + afficher
-        self._beginCase(currentName)         # === NEW
-        self.loadOneCase(currentName)        # === NEW (hook affichage)
-        print(f"[TractDesktop] Plan chargé {pid} S{session} — Cas {idx+1}/{len(self._caseList)} : {currentName}")
+        # === NEW ===  Progression persistée (index courant etc.)
+        self._prog = _load_progress(self._pid, self._session)
+        # On veut que le prochain NextCase charge l'élément d'indice _prog["index"]
+        self._caseOrder = list(order)
+        self._caseIndex = self._prog.get("index", 0) - 1
 
         slicer.util.infoDisplay(
-            f"Plan chargé pour {pid} (Session {session}).\nOrdre: {', '.join(self._caseList)}",
-            windowTitle="TractDesktop"
+            f"Plan chargé pour {pid} (Session {self._session}).\n"
+            f"Nombre de cas : {len(self._caseOrder)}\n"
+            f"Reprise à l'index : {self._prog.get('index',0)}"
         )
+
+        self.onNextCase()
+
+    def onNextCase(self):
+        if not self._caseOrder:
+            slicer.util.warningDisplay("Aucun plan chargé. Clique d'abord sur 'Load Study'.")
+            return
+
+        # === NEW ===  Sauver le cas précédent si actif
+        if self._currentCaseName:
+            self._endCase(save=True)
+
+        # Passer à l’index suivant
+        self._caseIndex += 1
+        if self._caseIndex >= len(self._caseOrder):
+            slicer.util.infoDisplay("Tous les cas de cette session sont terminés.")
+            return
+
+        # Nettoyer la scène des anciens faisceaux
+        self._clearPreviousFibers()
+
+        # Charger le prochain
+        caseName = self._caseOrder[self._caseIndex]
+        self.loadOneCase(caseName)
+
+        # === NEW ===  Démarrer bloc mesure par cas
+        self._beginCase(caseName)
+
+        # === NEW ===  Mettre à jour la progression persistée
+        if self._prog is not None:
+            self._prog["index"] = self._caseIndex + 1  # prochain à faire
+            ts = {"case": caseName, "startedAt": self._now_iso()}
+            self._prog.setdefault("timestamps", []).append(ts)
+            _save_progress(self._prog)
+    
+    def loadOneCase(self, caseName: str):
+        """
+        Charge le faisceau 'caseName' en supposant des FiberBundle natifs (SlicerDMRI),
+        via slicer.util.loadFiberBundle(path).
+        Chemin résolu par:
+          1) CaseFiles[case]
+          2) DataRoot + FilePattern.format(case=case)
+        """
+        alloc = self._alloc or {}
+        fpath = None
+
+        # 1) Mapping explicite
+        if "CaseFiles" in alloc and isinstance(alloc["CaseFiles"], dict):
+            fpath = alloc["CaseFiles"].get(caseName, None)
+
+        # 2) Pattern
+        if (not fpath) and alloc.get("DataRoot") and alloc.get("FilePattern"):
+            try:
+                fpath = os.path.join(alloc["DataRoot"], alloc["FilePattern"].format(case=caseName))
+            except Exception:
+                fpath = None
+
+        if not fpath:
+            slicer.util.warningDisplay(f"[{caseName}] Aucun chemin trouvé (CaseFiles/DataRoot+Pattern).")
+            return
+
+        fpath = os.path.normpath(fpath)
+        if not os.path.isfile(fpath):
+            slicer.util.errorDisplay(f"[{caseName}] Fichier introuvable:\n{fpath}")
+            return
+
+        # --- CHARGEMENT FiberBundle natif ---
+        try:
+            node = slicer.util.loadFiberBundle(fpath)  # <--- tu as confirmé que ça marche
+        except Exception as e:
+            slicer.util.errorDisplay(f"[{caseName}] Échec de chargement FiberBundle:\n{e}")
+            return
+
+        if not node:
+            slicer.util.errorDisplay(f"[{caseName}] loadFiberBundle a renvoyé None.\nFichier: {fpath}")
+            return
+        
+        self._currentFiberNode = node
+
+        # Nom + visibilité
+        try:
+            node.SetName(caseName)
+        except Exception:
+            pass
+        try:
+            if node.GetDisplayNode():
+                node.GetDisplayNode().SetVisibility(1)
+        except Exception:
+            pass
+
+        # Recentre la vue 3D (sinon on croit que rien n'a été chargé)
+        try:
+            slicer.util.resetThreeDViews()
+            lm = slicer.app.layoutManager()
+            v = lm.threeDWidget(0).threeDView()
+            v.resetFocalPoint()
+        except Exception as e:
+            print(f"[TractDesktop] Recentering error: {e}")
+
+        slicer.util.infoDisplay(f"Cas '{caseName}' chargé.", autoCloseMs=1200)
+
+
+    # === NEW ===
+    def _clearPreviousFibers(self):
+        """Supprime tous les vtkMRMLFiberBundleNode pour éviter la confusion visuelle."""
+        nodes = slicer.util.getNodesByClass("vtkMRMLFiberBundleNode")
+        for n in list(nodes) if nodes else []:
+            try:
+                slicer.mrmlScene.RemoveNode(n)
+            except Exception:
+                pass
+
+        self._currentFiberNode = None
 
     def onStartTractography(self):
         self.showTractographyWindow()
@@ -591,13 +713,25 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
     def _snapshotCaseMetrics(self) -> dict:
         """Capture les métriques actuelles pour le cas courant (sans effet de bord)."""
         duration = (time.perf_counter() - self._caseStartPerf) if self._caseStartPerf else 0.0
+
+        # === CHANGED === on lit sur le nœud chargé, pas via getNode("FiberBundle")
+        remaining = "N/A"
         try:
-            fiberNode = slicer.util.getNode("FiberBundle")
-            remaining = fiberNode.GetFilteredPolyData().GetNumberOfLines()
+            node = self._currentFiberNode
+            if node:
+                poly = None
+                # certains pipelines exposent GetFilteredPolyData, sinon GetPolyData
+                if hasattr(node, "GetFilteredPolyData"):
+                    poly = node.GetFilteredPolyData()
+                if poly is None and hasattr(node, "GetPolyData"):
+                    poly = node.GetPolyData()
+                if poly:
+                    remaining = poly.GetNumberOfLines()
         except Exception:
             remaining = "N/A"
+
         avg_inter = (sum(self._interactionDurations)/len(self._interactionDurations)
-                     if self._interactionDurations else 0.0)
+                    if self._interactionDurations else 0.0)
         return {
             "duration": duration,
             "updates": self.updateClickCount,
@@ -646,29 +780,7 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
 
 
 
-    def onNextCase(self):
-        print("ici nouveau code")
-        if self._prog is None or not self._caseList:
-            slicer.util.warningDisplay("Aucun plan chargé. Clique d’abord sur « loadStudy »."); 
-            return
-
-        # 1) Sauvegarder le cas courant
-        self._endCase(save=True)
-
-        # 2) Aller au suivant
-        if self._prog["index"] >= len(self._caseList) - 1:
-            slicer.util.infoDisplay("Dernier cas atteint. Utilise « End » pour terminer la session.")
-            return
-
-        self._prog["index"] += 1
-        self._prog["timestamps"].append({"event":"next","t":self._now_iso(),"idx":self._prog["index"]})
-        _save_progress(self._prog)
-
-        # 3) Démarrer + afficher
-        nextName = self._caseList[self._prog["index"]]
-        self._beginCase(nextName)
-        self.loadOneCase(nextName)
-        print(f"[TractDesktop] → Cas {self._prog['index']+1}/{len(self._caseList)} : {nextName}")
+    
 
 
     def onEndTractography(self):
@@ -677,31 +789,13 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
             slicer.util.warningDisplay("Le suivi n'est pas actif.")
             return
 
+        # === NEW ===  Clôture du CAS courant (sauvegarde par-cas)
+        self._endCase(save=True)
+
+        # Stopper le timer global (si tu veux pouvoir relancer Start pour un autre cas)
         self.timerRunning = False
-        duration = time.perf_counter() - self.startTime
 
-        try:
-            fiberNode = slicer.util.getNode("FiberBundle")
-            remaining = fiberNode.GetFilteredPolyData().GetNumberOfLines()
-        except Exception:
-            remaining = "N/A"
-
-        avg = (sum(self._interactionDurations)/len(self._interactionDurations)) if self._interactionDurations else 0.0  # NEW
-
-        print("Suivi terminé.")
-        print(f"Durée : {duration:.2f}s")
-        print(f"Updates : {self.updateClickCount}")
-        print(f"Interactions ROI (clic→relâche) : {self.roiInteractionCount}")                # NEW
-        print(f"Durée moyenne par interaction : {avg:.2f}s")                                 # NEW
-        print(f"Déplacements ROI : {self.roiMoveCount}")
-        print(f"Distance ROI (mm) : {self.roiDistanceMm:.2f}")
-        print(f"Fibres restantes : {remaining}")
-        print(f"Caméra — translation cumulée : {self.camTransMm:.2f} mm")
-        print(f"Caméra — rotation cumulée : {self.camRotDeg:.2f} °")
-
-        self.saveTractoSession(duration, self.updateClickCount, self.roiMoveCount, self.roiInteractionCount, remaining, self.roiDistanceMm, self.camTransMm, self.camRotDeg)
-
-        # remove camera observer
+        # Nettoyage observers caméra
         try:
             if self.cameraNode and self._camObs:
                 self.cameraNode.RemoveObserver(self._camObs)
@@ -710,7 +804,7 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         self._camObs = None
         self.cameraNode = None
 
-        # --- Nettoyer les 3 observers proprement ---
+        # Nettoyage observers ROI
         try:
             if self.roiNode:
                 for oid in (self.roiObserverStart, self.roiObserver, self.roiObserverEnd):
@@ -719,6 +813,9 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         except Exception:
             pass
         self.roiObserverStart = self.roiObserver = self.roiObserverEnd = None
+        self._observeParentTransform(enable=False)
+
+        slicer.util.infoDisplay("Session du cas clôturée et enregistrée.")
 
     
         self._observeParentTransform(enable=False)
@@ -734,20 +831,7 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
             writer.writerow([timestamp, f"{duration:.2f}", updateClicks, roiMoves, roiInteraction, numFibers, f"{roiDistanceMm:.2f}", f"{camTransMm:.2f}", f"{camRotDeg:.2f}"])
         slicer.util.infoDisplay(f"  Résultats enregistrés dans : {logFile}")
 
-    def loadOneCase(self, caseName: str):
-        """
-        Branche ici TON pipeline d'affichage pour un faisceau/dataset nommé `caseName`.
-        Exemple minimal : rendre visible un nœud 'caseName' s'il existe.
-        Remplace par ta logique (FiberBundleNode, Segmentation, Models, etc.).
-        """
-        try:
-            node = slicer.util.getFirstNodeByName(caseName)
-            if node and hasattr(node, "GetDisplayNode") and node.GetDisplayNode():
-                node.GetDisplayNode().SetVisibility(1)
-            else:
-                print(f"[TractDesktop] Astuce: crée/nomme un nœud '{caseName}' dans la scène pour l'afficher automatiquement.")
-        except Exception as e:
-            slicer.util.warningDisplay(f"Impossible d'afficher le cas '{caseName}' : {e}")
+    
 
         
 # TractDesktopTest
