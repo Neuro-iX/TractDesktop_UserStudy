@@ -524,7 +524,8 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         except Exception as e:
             print(f"[TractDesktop] Recentering error: {e}")
 
-        slicer.util.infoDisplay(f"Cas '{caseName}' chargé.", autoCloseMs=1200)
+        #slicer.util.infoDisplay(f"Cas '{caseName}' chargé.", autoCloseMs=1200)
+        slicer.util.infoDisplay(f"Le cas est chargé.", autoCloseMs=1200)
 
 
     # === NEW ===
