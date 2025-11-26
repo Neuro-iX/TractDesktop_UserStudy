@@ -31,9 +31,11 @@ APP_DATA_DIR = os.path.join(
 PID_JSON_DIR = os.path.join(APP_DATA_DIR, "by-participant")
 PROGRESS_DIR = os.path.join(APP_DATA_DIR, "progress")
 PERF_DIR = os.path.join(APP_DATA_DIR, "performance")
+CLEAN_FIBER_DIR = os.path.join(APP_DATA_DIR, "cleaned_fibers")
 os.makedirs(PID_JSON_DIR, exist_ok=True)
 os.makedirs(PROGRESS_DIR, exist_ok=True)
 os.makedirs(PERF_DIR, exist_ok=True)
+os.makedirs(CLEAN_FIBER_DIR, exist_ok=True)
 
 def _ask_text(parent, title, label, default=""):
     """Toujours retourner (text, ok) même si le binding Qt renvoie juste une string."""
@@ -314,15 +316,24 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         self._caseOrder: List[str] = []        # ordre des cas pour Desktop
         self._caseIndex: int = -1              # index courant (avant premier = -1)
 
-        # === NEW ===  Contexte participant + session + progression
+        # Contexte participant + session + progression
         self._pid: Optional[str] = None
         self._session: Optional[int] = None
         self._prog: Optional[Dict] = None
 
-        # === NEW ===  Contexte "cas courant"
+        # Contexte "cas courant"
         self._currentCaseName: Optional[str] = None
         self._caseStartPerf: Optional[float] = None
         self._caseStartIso: Optional[str] = None
+
+        # === NEW === faisceau courant + ref + segments
+        self._currentFiberNode = None          # faisceau à nettoyer
+        self._currentRefNode = None            # faisceau de référence (clean)
+        self._currentRefTransform = None       # transform de translation de la ref
+        self._currentSegNodes: List[vtk.vtkObject] = []   # segments anatomiques
+
+        self._needleNode = None
+        self._needleTransform = None
 
        
 
@@ -376,6 +387,32 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
 
     def _now_iso(self):
         return datetime.now().isoformat(timespec="seconds")
+    
+    # === NEW === helper pour patterns DataRoot + *Pattern
+
+    def _resolvePatternPath(self, patternKey: str, caseName: str) -> Optional[str]:
+        """
+        Construit un chemin à partir de DataRoot + pattern (ex: {case}_clean.vtk).
+        patternKey = 'FilePattern', 'RefPattern' ou 'SegPattern'.
+        """
+        if not self._alloc:
+            return None
+
+        root = self._alloc.get("DataRoot")
+        pattern = self._alloc.get(patternKey)
+        if not root or not pattern:
+            return None
+
+        try:
+            path = os.path.join(root, pattern.format(case=caseName))
+        except Exception:
+            return None
+
+        path = os.path.normpath(path)
+        if not os.path.isfile(path):
+            logging.warning(f"[TractDesktop] Fichier défini par {patternKey} introuvable : {path}")
+            return None
+        return path
     
     def onLoadStudy(self):
          # Demande PID
@@ -462,38 +499,27 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
     
     def loadOneCase(self, caseName: str):
         """
-        Charge le faisceau 'caseName' en supposant des FiberBundle natifs (SlicerDMRI),
-        via slicer.util.loadFiberBundle(path).
-        Chemin résolu par:
-          1) CaseFiles[case]
-          2) DataRoot + FilePattern.format(case=case)
+        Charge le faisceau 'caseName' (noisy) via FilePattern/CaseFiles,
+        puis la référence clean + segments.
         """
         alloc = self._alloc or {}
         fpath = None
 
-        # 1) Mapping explicite
         if "CaseFiles" in alloc and isinstance(alloc["CaseFiles"], dict):
             fpath = alloc["CaseFiles"].get(caseName, None)
 
-        # 2) Pattern
-        if (not fpath) and alloc.get("DataRoot") and alloc.get("FilePattern"):
-            try:
-                fpath = os.path.join(alloc["DataRoot"], alloc["FilePattern"].format(case=caseName))
-            except Exception:
-                fpath = None
+        if not fpath:
+            fpath = self._resolvePatternPath("FilePattern", caseName)
 
         if not fpath:
-            slicer.util.warningDisplay(f"[{caseName}] Aucun chemin trouvé (CaseFiles/DataRoot+Pattern).")
+            slicer.util.warningDisplay(f"[{caseName}] Aucun chemin trouvé pour le faisceau (FilePattern/CaseFiles).")
             return
+        
+        self._loadReferenceForCase(caseName)
 
-        fpath = os.path.normpath(fpath)
-        if not os.path.isfile(fpath):
-            slicer.util.errorDisplay(f"[{caseName}] Fichier introuvable:\n{fpath}")
-            return
-
-        # --- CHARGEMENT FiberBundle natif ---
+        # --- CHARGEMENT du faisceau à nettoyer (.vtk noisy) ---
         try:
-            node = slicer.util.loadFiberBundle(fpath)  # <--- tu as confirmé que ça marche
+            node = slicer.util.loadFiberBundle(fpath)
         except Exception as e:
             slicer.util.errorDisplay(f"[{caseName}] Échec de chargement FiberBundle:\n{e}")
             return
@@ -501,12 +527,11 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         if not node:
             slicer.util.errorDisplay(f"[{caseName}] loadFiberBundle a renvoyé None.\nFichier: {fpath}")
             return
-        
+
         self._currentFiberNode = node
 
-        # Nom + visibilité
         try:
-            node.SetName(caseName)
+            node.SetName("FiberBundle")
         except Exception:
             pass
         try:
@@ -515,7 +540,10 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         except Exception:
             pass
 
-        # Recentre la vue 3D (sinon on croit que rien n'a été chargé)
+        # === NEW === faisceau de référence + segments
+        
+        self._loadSegmentsForCase(caseName)
+
         try:
             slicer.util.resetThreeDViews()
             lm = slicer.app.layoutManager()
@@ -524,13 +552,188 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         except Exception as e:
             print(f"[TractDesktop] Recentering error: {e}")
 
-        #slicer.util.infoDisplay(f"Cas '{caseName}' chargé.", autoCloseMs=1200)
-        slicer.util.infoDisplay(f"Le cas est chargé.", autoCloseMs=1200)
+        slicer.util.infoDisplay("Le cas est chargé.", autoCloseMs=1200)
 
+    def _loadReferenceForCase(self, caseName: str):
+        """
+        Charge le faisceau CLEAN ({case}_clean.vtk),
+        le place à côté (X +40mm),
+        et le rend totalement non-modifiable.
+        """
+        refPath = self._resolvePatternPath("RefPattern", caseName)
+        if not refPath:
+            logging.warning(f"[TractDesktop] Aucun faisceau de référence pour {caseName}")
+            return
+
+        # --- Charger CLEAN ---
+        try:
+            refNode = slicer.util.loadFiberBundle(refPath)
+        except Exception as e:
+            logging.error(f"[TractDesktop] Erreur chargement CLEAN {caseName}: {e}")
+            return
+
+        if not refNode:
+            logging.error(f"[TractDesktop] CLEAN load renvoie None {caseName}")
+            return
+
+        refNode.SetName(f"{caseName}_CLEAN")
+
+        # --- Déplacement X +40mm ---
+        tnode = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLinearTransformNode",
+            f"{caseName}_CLEAN_XFM"
+        )
+        mat = vtk.vtkMatrix4x4()
+        mat.Identity()
+        mat.SetElement(0, 3, 100.0)
+        tnode.SetMatrixTransformToParent(mat)
+        refNode.SetAndObserveTransformNodeID(tnode.GetID())
+
+        # --- désactiver interaction ---
+        if refNode.GetDisplayNode():
+            refNode.GetDisplayNode().SetVisibility(1)
+        try: refNode.SetSelectable(False)
+        except: pass
+        try: refNode.SetHideFromEditors(True)
+        except: pass
+        try: refNode.SetLocked(True)
+        except: pass
+
+        self._currentRefNode = refNode
+        self._currentRefTransform = tnode
+
+                # === AJOUT : créer un needle aligné sur le CLEAN, +rot X 180° et +50mm IS ===
+        try:
+            # créer le modèle needle
+            createModelsLogic = slicer.modules.createmodels.logic()
+            needleModel = createModelsLogic.CreateNeedle(10.0, 1.0, 0.0, False)
+            needleModel.SetName(f"{caseName}_NEEDLE")
+
+            # récupérer la matrice du transform CLEAN
+            cleanMat = vtk.vtkMatrix4x4()
+            self._currentRefTransform.GetMatrixTransformToParent(cleanMat)
+
+            # matrice pour le needle = CLEAN + rotation LR 180° + translation +50mm en IS
+            # rotation 180° autour de l’axe LR (X)  → diag(1, -1, -1)
+            rotX180 = vtk.vtkMatrix4x4()
+            rotX180.Identity()
+            rotX180.SetElement(1, 1, -1)   # A (Y)
+            rotX180.SetElement(2, 2, -1)   # S (Z)
+
+            # Ttotal = Tclean * R180
+            needleMat = vtk.vtkMatrix4x4()
+            vtk.vtkMatrix4x4.Multiply4x4(cleanMat, rotX180, needleMat)
+
+            # décalage +50mm en IS (axe Z)
+            currentZ = needleMat.GetElement(2, 3)
+            needleMat.SetElement(2, 3, currentZ + 50.0)
+
+            # transform dédié au needle
+            needleTfm = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLLinearTransformNode",
+                f"{caseName}_NEEDLE_XFM"
+            )
+            needleTfm.SetMatrixTransformToParent(needleMat)
+
+            # attacher le needle à ce transform
+            needleModel.SetAndObserveTransformNodeID(needleTfm.GetID())
+
+            # garder des pointeurs pour nettoyage
+            self._needleNode = needleModel
+            self._needleTransform = needleTfm
+
+        except Exception as e:
+            logging.error(f"[TractDesktop] Erreur création needle pour {caseName}: {e}")
+
+
+    # === NEW === : segments .seg.nrrd
+    def _loadSegmentsForCase(self, caseName: str):
+        """
+        Charge {case}_seg.seg.nrrd
+
+        - crée la segmentation pour le faisceau NOISY (position originale)
+        - clone cette segmentation via le SubjectHierarchy (équivalent clic droit → Clone)
+        - attache le clone au même transform que le faisceau CLEAN
+          (self._currentRefTransform, par ex. FiberBundle1_CLEAN_XFM)
+        """
+        segPath = self._resolvePatternPath("SegPattern", caseName)
+        if not segPath:
+            logging.warning(f"[TractDesktop] Aucun segment pour {caseName}")
+            return
+
+        # --- Charger la segmentation du faisceau NOISY ---
+        try:
+            segNoisy = slicer.util.loadSegmentation(segPath)
+        except Exception as e:
+            logging.error(f"[TractDesktop] Erreur chargement seg {caseName}: {e}")
+            return
+
+        if not segNoisy:
+            logging.error(f"[TractDesktop] loadSegmentation a renvoyé None pour {caseName}")
+            return
+
+        segNoisy.SetName(f"{caseName}_SEG_NOISY")
+
+        # Afficher
+        try:
+            dispNoisy = segNoisy.GetDisplayNode()
+            if dispNoisy:
+                dispNoisy.SetVisibility(1)
+        except Exception:
+            pass
+
+        # --- CLONE via le SubjectHierarchy (comme dans l'exemple que tu as envoyé) ---
+        shNode = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(slicer.mrmlScene)
+        itemIDToClone = shNode.GetItemByDataNode(segNoisy)
+        if itemIDToClone == 0:
+            logging.error("[TractDesktop] Impossible de trouver l'item SubjectHierarchy pour la segmentation noisy.")
+            # On garde au moins la segmentation noisy
+            self._currentSegNodes = [segNoisy]
+            return
+
+        clonedItemID = slicer.modules.subjecthierarchy.logic().CloneSubjectHierarchyItem(shNode, itemIDToClone)
+        segClean = shNode.GetItemDataNode(clonedItemID)
+
+        if not segClean:
+            logging.error("[TractDesktop] CloneSubjectHierarchyItem n’a pas retourné de segmentation valide.")
+            self._currentSegNodes = [segNoisy]
+            return
+
+        segClean.SetName(f"{caseName}_SEG_CLEAN")
+
+        # Afficher le clone
+        try:
+            dispClean = segClean.GetDisplayNode()
+            if dispClean:
+                dispClean.SetVisibility(1)
+        except Exception:
+            pass
+
+        # Attacher le clone au transform du faisceau CLEAN
+        if self._currentRefTransform:
+            segClean.SetAndObserveTransformNodeID(self._currentRefTransform.GetID())
+            logging.info(
+                f"[TractDesktop] Seg clone attaché à {self._currentRefTransform.GetName()} pour {caseName}"
+            )
+        else:
+            logging.warning(
+                "[TractDesktop] Pas de transform CLEAN pour attacher la segmentation clone."
+            )
+
+        # (optionnel) verrouiller pour éviter des modifs accidentelles
+        for n in (segNoisy, segClean):
+            try:
+                n.SetLocked(True)
+            except Exception:
+                pass
+
+        # Pour pouvoir les supprimer au changement de cas
+        self._currentSegNodes = [segNoisy, segClean]
+        logging.info(f"[TractDesktop] Segments chargés pour {caseName} (NOISY + CLEAN clone)")
 
     # === NEW ===
     def _clearPreviousFibers(self):
-        """Supprime tous les vtkMRMLFiberBundleNode pour éviter la confusion visuelle."""
+        """Supprime faisceaux + segments + transform du cas précédent."""
         nodes = slicer.util.getNodesByClass("vtkMRMLFiberBundleNode")
         for n in list(nodes) if nodes else []:
             try:
@@ -538,7 +741,36 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
             except Exception:
                 pass
 
+        for n in self._currentSegNodes:
+            try:
+                slicer.mrmlScene.RemoveNode(n)
+            except Exception:
+                pass
+        self._currentSegNodes = []
+
+        if self._currentRefTransform:
+            try:
+                slicer.mrmlScene.RemoveNode(self._currentRefTransform)
+            except Exception:
+                pass
+
         self._currentFiberNode = None
+        self._currentRefNode = None
+        self._currentRefTransform = None
+
+        if self._needleNode:
+            try:
+                slicer.mrmlScene.RemoveNode(self._needleNode)
+            except Exception:
+                pass
+            self._needleNode = None
+
+        if self._needleTransform:
+            try:
+                slicer.mrmlScene.RemoveNode(self._needleTransform)
+            except Exception:
+                pass
+            self._needleTransform = None
 
     def onStartTractography(self):
         self.showTractographyWindow()
@@ -767,6 +999,23 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
                     f"{m['roiDist']:.2f}", f"{m['camTrans']:.2f}", f"{m['camRot']:.2f}", m["remaining"]
                 ])
             print(f"[TractDesktop] Cas sauvegardé: {self._pid} S{self._session} idx {self._prog['index']} {m['caseName']}")
+
+            # --- Sauvegarde du faisceau nettoyé pour ce cas ---
+            try:
+                if self._currentFiberNode:
+                    # index de cas (1, 2, 3, …) déjà utilisé dans le CSV
+                    idx = self._prog["index"]
+                    # Nom de fichier : Pxxx_S1_idx1_CaseName_clean.vtk
+                    fname = f"{self._pid}_S{self._session}_idx{idx}_{m['caseName']}_clean.vtk"
+                    outPath = os.path.join(CLEAN_FIBER_DIR, fname)
+
+                    ok = slicer.util.saveNode(self._currentFiberNode, outPath)
+                    if ok:
+                        logging.info(f"[TractDesktop] Faisceau nettoyé sauvegardé : {outPath}")
+                    else:
+                        logging.error(f"[TractDesktop] Échec saveNode pour : {outPath}")
+            except Exception as e:
+                logging.error(f"[TractDesktop] Erreur sauvegarde faisceau nettoyé : {e}")
 
             self.saveTractoSession(
                 m["duration"], m["updates"], m["roiMoves"], m["interactions"],
