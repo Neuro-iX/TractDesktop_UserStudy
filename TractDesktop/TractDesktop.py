@@ -585,7 +585,7 @@ class TractDesktopLogic(ScriptedLoadableModuleLogic):
         )
         mat = vtk.vtkMatrix4x4()
         mat.Identity()
-        mat.SetElement(0, 3, 100.0)
+        mat.SetElement(0, 3, -100.0)
         tnode.SetMatrixTransformToParent(mat)
         refNode.SetAndObserveTransformNodeID(tnode.GetID())
 
