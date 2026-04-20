@@ -61,7 +61,7 @@
    <item>
     <widget class="QPushButton" name="startTractography">
      <property name="text">
-      <string>Start Tractographhy display</string>
+      <string>Start Tractography display</string>
      </property>
     </widget>
    </item>
